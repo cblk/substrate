@@ -116,7 +116,12 @@ sc-keystore = { version = "2.0.0", path = "../../../client/keystore" }
 sc-consensus = { version = "0.8.0", path = "../../../client/consensus/common" }
 sc-consensus-babe = { version = "0.8.0", features = ["test-helpers"], path = "../../../client/consensus/babe" }
 sc-consensus-epochs = { version = "0.8.0", path = "../../../client/consensus/epochs" }
+sc-consensus-manual-seal = { version = "0.8.0", path = "../../../client/consensus/manual-seal" }
 sc-service-test = { version = "2.0.0", path = "../../../client/service/test" }
+sp-api = { version = "2.0.0",  path = "../../../primitives/api" }
+sc-executor = { version = "0.8.0", path = "../../../client/executor" }
+substrate-test-runner = { version = "0.8.0", path = "../../../test-utils/substrate-test-runner" }
+pallet-sudo = { version = "2.0.0", path = "../../../frame/sudo" }
 futures = "0.3.4"
 tempfile = "3.1.0"
 assert_cmd = "1.0"

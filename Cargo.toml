@@ -176,6 +176,7 @@ members = [
 	"test-utils/runtime/client",
 	"test-utils/runtime/transaction-pool",
 	"test-utils/test-crate",
+	"test-utils/substrate-test-runner",
 	"utils/browser",
 	"utils/build-script-utils",
 	"utils/fork-tree",
