@@ -34,8 +34,8 @@ use sp_consensus::{BlockOrigin, BlockStatus,
 	block_validation::{BlockAnnounceValidator, Validation},
 	import_queue::{IncomingBlock, BlockImportResult, BlockImportError}
 };
-use crate::{
-	protocol::message::{self, BlockAnnounce, BlockAttributes, BlockRequest, BlockResponse, Roles},
+use crate::protocol::message::{
+	self, BlockAnnounce, BlockAttributes, BlockRequest, BlockResponse, Roles,
 };
 use either::Either;
 use extra_requests::ExtraRequests;
@@ -44,7 +44,10 @@ use log::{debug, trace, warn, info, error};
 use sp_runtime::{
 	Justification,
 	generic::BlockId,
-	traits::{Block as BlockT, Header, NumberFor, Zero, One, CheckedSub, SaturatedConversion, Hash, HashFor}
+	traits::{
+		Block as BlockT, Header as HeaderT, NumberFor, Zero, One, CheckedSub, SaturatedConversion,
+		Hash, HashFor,
+	},
 };
 use sp_arithmetic::traits::Saturating;
 use std::{
@@ -1600,8 +1603,7 @@ fn fork_sync_request<B: BlockT>(
 	finalized: NumberFor<B>,
 	attributes: &message::BlockAttributes,
 	check_block: impl Fn(&B::Hash) -> BlockStatus,
-) -> Option<(B::Hash, BlockRequest<B>)>
-{
+) -> Option<(B::Hash, BlockRequest<B>)> {
 	targets.retain(|hash, r| {
 		if r.number <= finalized {
 			trace!(target: "sync", "Removed expired fork sync request {:?} (#{})", hash, r.number);
@@ -1690,15 +1692,17 @@ fn validate_blocks<Block: BlockT>(blocks: &Vec<message::BlockData<Block>>, who: 
 
 #[cfg(test)]
 mod test {
-	use super::message::FromBlock;
+	use super::message::{FromBlock, BlockState, BlockData};
 	use super::*;
 	use sc_block_builder::BlockBuilderProvider;
 	use sp_blockchain::HeaderBackend;
 	use sp_consensus::block_validation::DefaultBlockAnnounceValidator;
 	use substrate_test_runtime_client::{
-		runtime::{Block, Hash},
+		runtime::{Block, Hash, Header},
 		ClientBlockImportExt, DefaultTestClientBuilderExt, TestClientBuilder, TestClientBuilderExt,
+		BlockBuilderExt,
 	};
+	use futures::{future::poll_fn, executor::block_on};
 
 	#[test]
 	fn processes_empty_response_on_justification_request_for_unknown_block() {
@@ -1845,5 +1849,137 @@ mod test {
 			sync.peers.get(&peer_id3).unwrap().state,
 			PeerSyncState::DownloadingJustification(b1_hash),
 		);
+	}
+
+	fn send_block_announce(
+		header: Header,
+		peer_id: &PeerId,
+		sync: &mut ChainSync<Block>,
+	) {
+		let block_annnounce = BlockAnnounce {
+			header: header.clone(),
+			state: Some(BlockState::Best),
+			data: Some(Vec::new()),
+		};
+
+		sync.push_block_announce_validation(
+			peer_id.clone(),
+			header.hash(),
+			block_annnounce,
+			true,
+		);
+
+		// Poll until we have procssed the block announcement
+		block_on(poll_fn(|cx| loop {
+			if sync.poll_block_announce_validation(cx).is_pending() {
+				break Poll::Ready(())
+			}
+		}))
+	}
+
+	#[test]
+	fn lol() {
+		sp_tracing::try_init_simple();
+
+		let mut client = Arc::new(TestClientBuilder::new().build());
+		let info = client.info();
+
+		let mut sync = ChainSync::new(
+			Roles::AUTHORITY,
+			client.clone(),
+			&info,
+			Box::new(DefaultBlockAnnounceValidator),
+			1,
+		);
+
+		let peer_id1 = PeerId::random();
+		let peer_id2 = PeerId::random();
+
+		let mut client2 = client.clone();
+		let mut build_block = || {
+			let block = client2.new_block(Default::default()).unwrap().build().unwrap().block;
+			client2.import(BlockOrigin::Own, block.clone()).unwrap();
+
+			block.header().clone()
+		};
+
+		let mut client2 = client.clone();
+		let mut build_block_at = |at, import| {
+			let mut block_builder = client2.new_block_at(&BlockId::Hash(at), Default::default(), false)
+				.unwrap();
+			// Make sure we generate a different block as fork
+			block_builder.push_storage_change(vec![1, 2, 3], Some(vec![4, 5, 6])).unwrap();
+
+			let block = block_builder.build().unwrap().block;
+
+			if import {
+				client2.import(BlockOrigin::Own, block.clone()).unwrap();
+			}
+
+			block
+		};
+
+		let block1 = build_block();
+		let block2 = build_block();
+		let block3 = build_block();
+		let block3_fork = build_block_at(block2.hash(), false);
+
+		// Add two peers which are on block 1.
+		sync.new_peer(peer_id1.clone(), block1.hash(), 1).unwrap();
+		sync.new_peer(peer_id2.clone(), block1.hash(), 1).unwrap();
+
+		// Tell sync that our best block is 3.
+		sync.update_chain_info(&block3.hash(), 3);
+
+		// There should be no requests.
+		assert!(sync.block_requests().collect::<Vec<_>>().is_empty());
+
+		// Let peer2 announce a fork of block 3
+		send_block_announce(block3_fork.header().clone(), &peer_id2, &mut sync);
+
+		// Import and tell sync that we now have the fork.
+		client.import(BlockOrigin::Own, block3_fork.clone()).unwrap();
+		sync.update_chain_info(&block3_fork.hash(), 3);
+
+		let block4 = build_block_at(block3_fork.hash(), false);
+
+		// Let peer2 announce block 4 and check that sync wants to get the block.
+		send_block_announce(block4.header().clone(), &peer_id2, &mut sync);
+
+		let requests = sync.block_requests().collect::<Vec<_>>();
+		assert_eq!(1, requests.len());
+		assert_eq!(&peer_id2, requests[0].0);
+		assert_eq!(FromBlock::Hash(block4.hash()), requests[0].1.from);
+		assert_eq!(Some(2), requests[0].1.max);
+
+		// Peer1 announces the same block, but as the common block is still `1`, sync will request
+		// block 2 again.
+		send_block_announce(block4.header().clone(), &peer_id1, &mut sync);
+
+		let requests = sync.block_requests().collect::<Vec<_>>();
+		assert_eq!(1, requests.len());
+		assert_eq!(&peer_id1, requests[0].0);
+
+		let request = requests[0].1.clone();
+		drop(requests);
+
+		assert_eq!(FromBlock::Number(2), request.from);
+		assert_eq!(Some(1), request.max);
+
+		let response = BlockResponse::<Block> {
+			id: 0,
+			blocks: vec![
+				BlockData::<Block> {
+					hash: block2.hash(),
+					header: Some(block2.clone()),
+					body: Some(Vec::new()),
+					receipt: None,
+					message_queue: None,
+					justification: None,
+				}
+			]
+		};
+		let res = sync.on_block_data(&peer_id1, Some(request), response).unwrap();
+		panic!("{:?}", res);
 	}
 }
